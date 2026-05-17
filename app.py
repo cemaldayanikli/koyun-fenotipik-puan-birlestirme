@@ -196,30 +196,45 @@ def otomatik_aktif_eslestir(columns: list[str]) -> dict:
     return cm
 
 
-def _yas_normalize(seri: pd.Series, bugun_yil: int) -> tuple[pd.Series, str]:
+def _yas_normalize(seri: pd.Series, bugun_yil: int, format_secim: str = 'otomatik') -> tuple[pd.Series, str]:
     """Yaş değerlerini standart yıl cinsine çevir.
-    Değer 1900-2100 aralığındaysa → doğum yılı kabul edip (bugün - değer) yap.
-    Tarih ise yıllara çevir.
-    Aksi halde doğrudan döner.
+    format_secim: 'otomatik' | 'yil' | 'dogum_yili' | 'tarih' | 'gun'
     """
+    if format_secim == 'yil':
+        return pd.to_numeric(seri, errors='coerce'), 'yil'
+    if format_secim == 'dogum_yili':
+        s_num = pd.to_numeric(seri, errors='coerce')
+        return (bugun_yil - s_num).clip(lower=0), 'dogum_yili'
+    if format_secim == 'tarih':
+        s_dt = pd.to_datetime(seri, errors='coerce', dayfirst=True)
+        yas = (pd.Timestamp(year=bugun_yil, month=1, day=1) - s_dt).dt.days / 365.25
+        return yas.round(1), 'tarihten'
+    if format_secim == 'gun':
+        s_num = pd.to_numeric(seri, errors='coerce')
+        return (s_num / 365).round(1), 'gun_cinsi'
+
+    # Otomatik tanıma
     s_num = pd.to_numeric(seri, errors='coerce')
-    if s_num.notna().any():
+    if s_num.notna().sum() > len(s_num) * 0.3:  # En az %30 sayısal
         med = s_num.median()
         if 1900 <= med <= 2100:
             return (bugun_yil - s_num).clip(lower=0), 'dogum_yili'
-        if med > 100:  # Belki gün cinsinden? Aylar?
+        if med > 100:
             return (s_num / 365).round(1), 'gun_cinsi'
         return s_num, 'yil'
     # Tarih dene
-    s_dt = pd.to_datetime(seri, errors='coerce')
+    s_dt = pd.to_datetime(seri, errors='coerce', dayfirst=True)
     if s_dt.notna().any():
         yas = (pd.Timestamp(year=bugun_yil, month=1, day=1) - s_dt).dt.days / 365.25
         return yas.round(1), 'tarihten'
     return s_num, 'yil'
 
 
-def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> tuple[pd.DataFrame, dict]:
+def aktif_df_olustur(raw: pd.DataFrame, mapping: dict, yas_format: str = 'otomatik',
+                      yas_kaynak: str = 'auto') -> tuple[pd.DataFrame, dict]:
     """Kullanıcı eşleştirmesine göre standart sütunlu aktif liste üret.
+    yas_format: 'otomatik' | 'yil' | 'dogum_yili' | 'tarih' | 'gun'
+    yas_kaynak: 'auto' (önce dogum_tar dene, yoksa yas) | 'dogum_tar' (zorla) | 'yas' (zorla)
     Dönüş: (DataFrame, info_dict). info_dict yaş dönüşüm tipini içerir.
     """
     out = pd.DataFrame()
@@ -231,25 +246,40 @@ def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> tuple[pd.DataFrame, di
         out['UKN'] = raw[mapping['ukn']].astype(str).str.strip()
 
     bugun_yil = datetime.now().year
-    # Önce doğum tarihinden yaş hesapla (en güvenilir)
     yas_set = False
+
+    # Doğum Tarihi sütununu her durumda al
     if mapping.get('dogum_tar'):
-        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce')
+        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce', dayfirst=True)
         if dt.notna().any():
             out['Doğum Tarihi'] = dt
+
+    # Yaş kaynağı: 'auto' → önce dogum_tar, sonra yas. 'dogum_tar' / 'yas' zorla.
+    use_dogum_tar = yas_kaynak in ('auto', 'dogum_tar') and mapping.get('dogum_tar')
+    use_yas      = yas_kaynak in ('auto', 'yas') and mapping.get('yas')
+
+    if yas_kaynak == 'dogum_tar' and not mapping.get('dogum_tar'):
+        info['uyari'] = "Yaş kaynağı 'Doğum Tarihi' seçildi ama eşleştirilmedi — Yaş alanına bakılıyor."
+        use_yas = bool(mapping.get('yas'))
+    if yas_kaynak == 'yas' and not mapping.get('yas'):
+        info['uyari'] = "Yaş kaynağı 'Yaş alanı' seçildi ama eşleştirilmedi — Doğum Tarihi'ne bakılıyor."
+        use_dogum_tar = bool(mapping.get('dogum_tar'))
+
+    if use_dogum_tar:
+        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce', dayfirst=True)
+        if dt.notna().any():
             yas_d = (pd.Timestamp(year=bugun_yil, month=1, day=1) - dt).dt.days / 365.25
             out['Aktif Yaş'] = yas_d.round(1)
-            info['yas_kaynak'] = 'Doğum Tarihinden hesaplandı'
+            info['yas_kaynak'] = f"Doğum Tarihinden ('{mapping['dogum_tar']}') hesaplandı"
             yas_set = True
 
-    # Yaş alanı eşleşmişse ve henüz set edilmediyse — veya doğum tarihi yetersizse fallback
-    if mapping.get('yas') and not yas_set:
-        yas_norm, tip = _yas_normalize(raw[mapping['yas']], bugun_yil)
+    if use_yas and not yas_set:
+        yas_norm, tip = _yas_normalize(raw[mapping['yas']], bugun_yil, format_secim=yas_format)
         out['Aktif Yaş'] = yas_norm
         info['yas_kaynak'] = {
-            'dogum_yili': f"'{mapping['yas']}' doğum yılı olarak algılandı → {bugun_yil} − değer",
+            'dogum_yili': f"'{mapping['yas']}' doğum yılı olarak yorumlandı → {bugun_yil} − değer",
             'tarihten':   f"'{mapping['yas']}' tarihten yaşa çevrildi",
-            'gun_cinsi':  f"'{mapping['yas']}' gün cinsinden algılandı → /365",
+            'gun_cinsi':  f"'{mapping['yas']}' gün cinsinden → /365",
             'yil':        f"'{mapping['yas']}' doğrudan yaş olarak kullanıldı",
         }.get(tip, mapping['yas'])
 
@@ -456,31 +486,72 @@ with st.sidebar:
 
     st.subheader('2. Öneri Şablonu')
     sablon_adi = st.selectbox(
-        'Şablon',
+        'Şablon (başlangıç değerleri)',
         ['Standart', 'Sıkı', 'Gevşek', 'Özel'],
         index=0,
-        help='Hibrit kural: Puan + Yaş + (opsiyonel) Tek doğum cezası',
+        help='Şablonu seçtikten sonra aşağıdaki tüm parametreleri düzenleyebilirsin.',
+        key='sablon_adi',
     )
 
-    if sablon_adi == 'Özel':
-        if 'ozel_sablon' not in st.session_state:
-            st.session_state.ozel_sablon = dict(SABLONLAR['Standart'])
-        s = st.session_state.ozel_sablon
+    # Şablon değişince parametreleri sıfırla
+    if st.session_state.get('_son_sablon') != sablon_adi:
+        st.session_state['_son_sablon'] = sablon_adi
+        baz = dict(SABLONLAR['Standart']) if sablon_adi == 'Özel' else dict(SABLONLAR[sablon_adi])
+        st.session_state['aktif_sablon'] = baz
+        # Widget key'leri de güncellensin
+        for k, v in baz.items():
+            st.session_state[f'param_{k}'] = v
+
+    s = st.session_state['aktif_sablon']
+
+    st.caption('⚙️ Tüm parametreler düzenlenebilir — şablon sadece başlangıç değeri verir.')
+
+    c1, c2 = st.columns(2)
+    s['damizlik_min_puan'] = c1.number_input(
+        'Damızlık min puan',
+        value=float(s['damizlik_min_puan']),
+        min_value=0.0, max_value=100.0, step=1.0,
+        key='param_damizlik_min_puan',
+    )
+    s['damizlik_max_yas'] = c2.number_input(
+        'Damızlık max yaş',
+        value=int(s['damizlik_max_yas']),
+        min_value=1, max_value=20, step=1,
+        key='param_damizlik_max_yas',
+    )
+    s['reforme_max_puan'] = c1.number_input(
+        'Reforme max puan',
+        value=float(s['reforme_max_puan']),
+        min_value=0.0, max_value=100.0, step=1.0,
+        key='param_reforme_max_puan',
+    )
+    s['reforme_min_yas'] = c2.number_input(
+        'Reforme min yaş',
+        value=int(s['reforme_min_yas']),
+        min_value=1, max_value=20, step=1,
+        key='param_reforme_min_yas',
+    )
+    s['tek_dogum_cezasi'] = st.checkbox(
+        'Tek doğum cezası (yaşlı + T + düşük puan → reforme)',
+        value=bool(s['tek_dogum_cezasi']),
+        key='param_tek_dogum_cezasi',
+    )
+    if s['tek_dogum_cezasi']:
         c1, c2 = st.columns(2)
-        s['damizlik_min_puan']  = c1.number_input('Damızlık min puan', value=float(s['damizlik_min_puan']), step=1.0)
-        s['damizlik_max_yas']   = c2.number_input('Damızlık max yaş', value=int(s['damizlik_max_yas']), step=1)
-        s['reforme_max_puan']   = c1.number_input('Reforme max puan', value=float(s['reforme_max_puan']), step=1.0)
-        s['reforme_min_yas']    = c2.number_input('Reforme min yaş', value=int(s['reforme_min_yas']), step=1)
-        s['tek_dogum_cezasi']   = st.checkbox('Tek doğum cezası', value=bool(s['tek_dogum_cezasi']))
-        if s['tek_dogum_cezasi']:
-            c1, c2 = st.columns(2)
-            s['tek_dogum_min_yas']  = c1.number_input('TD min yaş',  value=int(s['tek_dogum_min_yas']), step=1)
-            s['tek_dogum_max_puan'] = c2.number_input('TD max puan', value=float(s['tek_dogum_max_puan']), step=1.0)
-        secili_sablon = s
-    else:
-        secili_sablon = SABLONLAR[sablon_adi]
-        with st.expander(f'"{sablon_adi}" şablon detayları', expanded=False):
-            st.json(secili_sablon)
+        s['tek_dogum_min_yas'] = c1.number_input(
+            'TD min yaş',
+            value=int(s['tek_dogum_min_yas']),
+            min_value=1, max_value=20, step=1,
+            key='param_tek_dogum_min_yas',
+        )
+        s['tek_dogum_max_puan'] = c2.number_input(
+            'TD max puan',
+            value=float(s['tek_dogum_max_puan']),
+            min_value=0.0, max_value=100.0, step=1.0,
+            key='param_tek_dogum_max_puan',
+        )
+
+    secili_sablon = s
 
     st.subheader('3. Öneri Hangi Ortalamaya Göre?')
     hangi_ort = st.radio(
@@ -641,9 +712,43 @@ if aktif_file:
                 st.session_state[f'aktif_sel_{alan}'] = v
             st.rerun()
 
+    # Yaş kaynağı + format seçimi
+    st.subheader('Yaş Hesaplama')
+    c1, c2 = st.columns(2)
+    yas_kaynak_label = {
+        'auto':       'Otomatik (önce Doğum Tarihi, yoksa Yaş alanı)',
+        'dogum_tar':  'Sadece Doğum Tarihi sütunundan',
+        'yas':        'Sadece Yaş sütunundan',
+    }
+    yas_kaynak = c1.radio(
+        'Yaş hangi sütundan hesaplansın?',
+        options=list(yas_kaynak_label.keys()),
+        format_func=lambda k: yas_kaynak_label[k],
+        index=0,
+        key='yas_kaynak_radio',
+    )
+
+    yas_format_label = {
+        'otomatik':    'Otomatik tanı (değere bakarak)',
+        'yil':         'Doğrudan yaş (yıl: 0–20)',
+        'dogum_yili':  'Doğum yılı (1900–2100) → bugün − değer',
+        'tarih':       'Doğum tarihi (gg.aa.yyyy)',
+        'gun':         'Gün cinsi → /365',
+    }
+    yas_format = c2.selectbox(
+        '"Yaş" sütunu formatı (sadece Yaş sütunu kullanılırsa)',
+        options=list(yas_format_label.keys()),
+        format_func=lambda k: yas_format_label[k],
+        index=0,
+        key='yas_format_sel',
+        help='Eğer Yaş sütununda doğum yılı varsa "Doğum yılı"nı seç. Doğum Tarihi sütununa eşleyip "Sadece Doğum Tarihi" seçmek daha sağlam.',
+    )
+
     # Eşleştirmeyi uygula
     try:
-        aktif_df, aktif_info = aktif_df_olustur(raw, mapping)
+        aktif_df, aktif_info = aktif_df_olustur(
+            raw, mapping, yas_format=yas_format, yas_kaynak=yas_kaynak,
+        )
     except ValueError as e:
         st.error(str(e))
         st.stop()
@@ -651,8 +756,20 @@ if aktif_file:
         st.error(f'Aktif liste işlenemedi: {e}')
         st.stop()
 
+    if aktif_info.get('uyari'):
+        st.warning(f"⚠️ {aktif_info['uyari']}")
     if aktif_info.get('yas_kaynak'):
         st.info(f"ℹ️ Yaş kaynağı: {aktif_info['yas_kaynak']}")
+
+    # Yaş istatistikleri (debug için)
+    if 'Aktif Yaş' in aktif_df.columns and aktif_df['Aktif Yaş'].notna().any():
+        yas_min  = aktif_df['Aktif Yaş'].min()
+        yas_max  = aktif_df['Aktif Yaş'].max()
+        yas_mean = aktif_df['Aktif Yaş'].mean()
+        st.caption(
+            f"📊 Yaş dağılımı: min={yas_min:.1f}, ort={yas_mean:.1f}, max={yas_max:.1f}. "
+            f"Beklediğin gibi mi? Değilse 'Yaş sütunu formatı'nı değiştir."
+        )
 
     # Irk filtresi
     if 'Irk' in aktif_df.columns:
