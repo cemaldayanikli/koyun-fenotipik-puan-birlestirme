@@ -130,8 +130,9 @@ def puan_dosyasi_oku(file, yil_override: int | None = None) -> tuple[pd.DataFram
 AKTIF_ALANLAR = {
     'koyun_no':   {'label': 'Koyun No (birleştirme anahtarı) ★', 'keywords': ['isletme no', 'işletme no', 'koyun no', 'koyunno', 'işletme', 'isletme']},
     'ukn':        {'label': 'UKN / Küpe No',                     'keywords': ['kupe no', 'küpe no', 'ukn', 'ulusal', 'kupeno']},
-    'yas':        {'label': 'Yaş / Çağı',                        'keywords': ['cagi', 'çağı', 'yas', 'yaş', 'cag']},
-    'dogum_tipi': {'label': 'Doğum Tipi',                        'keywords': ['dogum tipi', 'doğum tipi']},
+    'yas':        {'label': 'Yaş (sayısal)',                     'keywords': ['yas', 'yaş']},
+    'cag_kat':    {'label': 'Çağı / Kategori (koyun, toklu, kuzu...)', 'keywords': ['cagi', 'çağı', 'cag', 'çağ', 'kategori', 'sinif', 'sınıf']},
+    'dogum_tipi': {'label': 'Doğum Tipi (T/İ/Ü)',                'keywords': ['dogum tipi', 'doğum tipi']},
     'dogum_tar':  {'label': 'Doğum Tarihi',                      'keywords': ['dogum tarihi', 'doğum tarihi']},
     'irk':        {'label': 'Irk (filtre için)',                 'keywords': ['irk', 'cins']},
     'padok':      {'label': 'Padok',                             'keywords': ['padok', 'aktif padok']},
@@ -285,6 +286,8 @@ def aktif_df_olustur(raw: pd.DataFrame, mapping: dict, yas_format: str = 'otomat
 
     if mapping.get('dogum_tipi'):
         out['Aktif Doğum Tipi'] = raw[mapping['dogum_tipi']].astype(str).str.strip()
+    if mapping.get('cag_kat'):
+        out['Çağı'] = raw[mapping['cag_kat']].astype(str).str.strip()
     if mapping.get('irk'):
         out['Irk'] = raw[mapping['irk']].astype(str).str.strip()
     if mapping.get('padok'):
@@ -551,6 +554,21 @@ with st.sidebar:
             key='param_tek_dogum_max_puan',
         )
 
+    # Parametre tutarlılığı uyarıları
+    uyarilar = []
+    if s['reforme_min_yas'] <= s['damizlik_max_yas']:
+        uyarilar.append(
+            f"⚠️ **Reforme min yaş ({s['reforme_min_yas']}) ≤ Damızlık max yaş ({s['damizlik_max_yas']})** — "
+            f"reforme yaş eşiği damızlık eşiğinden büyük olmalı, yoksa damızlık yaş aralığındaki koyunlar reforme'ye düşer."
+        )
+    if s['reforme_max_puan'] >= s['damizlik_min_puan']:
+        uyarilar.append(
+            f"⚠️ **Reforme max puan ({s['reforme_max_puan']}) ≥ Damızlık min puan ({s['damizlik_min_puan']})** — "
+            f"puan eşikleri çakışıyor. Reforme max < Damızlık min olmalı (örn: reforme 40, damızlık 60)."
+        )
+    for u in uyarilar:
+        st.warning(u)
+
     secili_sablon = s
 
     st.subheader('3. Öneri Hangi Ortalamaya Göre?')
@@ -771,22 +789,44 @@ if aktif_file:
             f"Beklediğin gibi mi? Değilse 'Yaş sütunu formatı'nı değiştir."
         )
 
-    # Irk filtresi
-    if 'Irk' in aktif_df.columns:
-        st.subheader('Irk Filtresi')
-        irklar = sorted({v for v in aktif_df['Irk'].dropna().tolist() if str(v).strip()})
-        sec_key = 'aktif_irk_secim'
-        if sec_key not in st.session_state:
-            st.session_state[sec_key] = irklar
-        secili_irklar = st.multiselect(
-            'Hangi ırklar dahil edilsin? (Boş = hepsi)',
-            options=irklar,
-            key=sec_key,
-        )
-        if secili_irklar:
-            before = len(aktif_df)
-            aktif_df = aktif_df[aktif_df['Irk'].isin(secili_irklar)].reset_index(drop=True)
-            st.info(f"Irk filtresi: **{', '.join(secili_irklar)}** — {before} → {len(aktif_df)} koyun.")
+    # Irk + Çağı filtreleri
+    if 'Irk' in aktif_df.columns or 'Çağı' in aktif_df.columns:
+        st.subheader('Filtreler')
+        c1, c2 = st.columns(2)
+
+        if 'Irk' in aktif_df.columns:
+            with c1:
+                irklar = sorted({v for v in aktif_df['Irk'].dropna().tolist() if str(v).strip() and str(v).lower() != 'nan'})
+                sec_key = 'aktif_irk_secim'
+                if sec_key not in st.session_state:
+                    st.session_state[sec_key] = irklar
+                secili_irklar = st.multiselect(
+                    f'Irk ({len(irklar)} seçenek) — boş = hepsi',
+                    options=irklar,
+                    key=sec_key,
+                )
+                if secili_irklar:
+                    before = len(aktif_df)
+                    aktif_df = aktif_df[aktif_df['Irk'].isin(secili_irklar)].reset_index(drop=True)
+                    st.caption(f"Irk: **{', '.join(secili_irklar)}** — {before} → {len(aktif_df)}")
+
+        if 'Çağı' in aktif_df.columns:
+            with c2:
+                cag_listesi = sorted({v for v in aktif_df['Çağı'].dropna().tolist() if str(v).strip() and str(v).lower() != 'nan'})
+                cag_key = 'aktif_cag_secim'
+                if cag_key not in st.session_state:
+                    # Varsayılan: "koyun" ve "toklu" geçenler önseçili
+                    onceden_secili = [c for c in cag_listesi if any(k in _norm(c) for k in ('koyun', 'toklu', 'disi'))]
+                    st.session_state[cag_key] = onceden_secili if onceden_secili else cag_listesi
+                secili_cag = st.multiselect(
+                    f'Çağı / Kategori ({len(cag_listesi)} seçenek) — boş = hepsi',
+                    options=cag_listesi,
+                    key=cag_key,
+                )
+                if secili_cag:
+                    before = len(aktif_df)
+                    aktif_df = aktif_df[aktif_df['Çağı'].isin(secili_cag)].reset_index(drop=True)
+                    st.caption(f"Çağı: **{', '.join(secili_cag)}** — {before} → {len(aktif_df)}")
 
     st.success(f'✓ Aktif listede **{len(aktif_df)}** koyun (eşleştirme uygulandı).')
     with st.expander('Standart aktif liste önizleme', expanded=False):
