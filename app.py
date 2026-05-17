@@ -196,20 +196,65 @@ def otomatik_aktif_eslestir(columns: list[str]) -> dict:
     return cm
 
 
-def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """Kullanıcı eşleştirmesine göre standart sütunlu aktif liste üret."""
+def _yas_normalize(seri: pd.Series, bugun_yil: int) -> tuple[pd.Series, str]:
+    """Yaş değerlerini standart yıl cinsine çevir.
+    Değer 1900-2100 aralığındaysa → doğum yılı kabul edip (bugün - değer) yap.
+    Tarih ise yıllara çevir.
+    Aksi halde doğrudan döner.
+    """
+    s_num = pd.to_numeric(seri, errors='coerce')
+    if s_num.notna().any():
+        med = s_num.median()
+        if 1900 <= med <= 2100:
+            return (bugun_yil - s_num).clip(lower=0), 'dogum_yili'
+        if med > 100:  # Belki gün cinsinden? Aylar?
+            return (s_num / 365).round(1), 'gun_cinsi'
+        return s_num, 'yil'
+    # Tarih dene
+    s_dt = pd.to_datetime(seri, errors='coerce')
+    if s_dt.notna().any():
+        yas = (pd.Timestamp(year=bugun_yil, month=1, day=1) - s_dt).dt.days / 365.25
+        return yas.round(1), 'tarihten'
+    return s_num, 'yil'
+
+
+def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> tuple[pd.DataFrame, dict]:
+    """Kullanıcı eşleştirmesine göre standart sütunlu aktif liste üret.
+    Dönüş: (DataFrame, info_dict). info_dict yaş dönüşüm tipini içerir.
+    """
     out = pd.DataFrame()
+    info = {}
     if 'koyun_no' not in mapping or not mapping['koyun_no']:
         raise ValueError("Koyun No alanı eşleştirilmedi.")
     out['Koyun No'] = pd.to_numeric(raw[mapping['koyun_no']], errors='coerce').astype('Int64')
     if mapping.get('ukn'):
         out['UKN'] = raw[mapping['ukn']].astype(str).str.strip()
-    if mapping.get('yas'):
-        out['Aktif Yaş'] = pd.to_numeric(raw[mapping['yas']], errors='coerce')
+
+    bugun_yil = datetime.now().year
+    # Önce doğum tarihinden yaş hesapla (en güvenilir)
+    yas_set = False
+    if mapping.get('dogum_tar'):
+        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce')
+        if dt.notna().any():
+            out['Doğum Tarihi'] = dt
+            yas_d = (pd.Timestamp(year=bugun_yil, month=1, day=1) - dt).dt.days / 365.25
+            out['Aktif Yaş'] = yas_d.round(1)
+            info['yas_kaynak'] = 'Doğum Tarihinden hesaplandı'
+            yas_set = True
+
+    # Yaş alanı eşleşmişse ve henüz set edilmediyse — veya doğum tarihi yetersizse fallback
+    if mapping.get('yas') and not yas_set:
+        yas_norm, tip = _yas_normalize(raw[mapping['yas']], bugun_yil)
+        out['Aktif Yaş'] = yas_norm
+        info['yas_kaynak'] = {
+            'dogum_yili': f"'{mapping['yas']}' doğum yılı olarak algılandı → {bugun_yil} − değer",
+            'tarihten':   f"'{mapping['yas']}' tarihten yaşa çevrildi",
+            'gun_cinsi':  f"'{mapping['yas']}' gün cinsinden algılandı → /365",
+            'yil':        f"'{mapping['yas']}' doğrudan yaş olarak kullanıldı",
+        }.get(tip, mapping['yas'])
+
     if mapping.get('dogum_tipi'):
         out['Aktif Doğum Tipi'] = raw[mapping['dogum_tipi']].astype(str).str.strip()
-    if mapping.get('dogum_tar'):
-        out['Doğum Tarihi'] = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce')
     if mapping.get('irk'):
         out['Irk'] = raw[mapping['irk']].astype(str).str.strip()
     if mapping.get('padok'):
@@ -219,7 +264,7 @@ def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     if mapping.get('aciklama'):
         out['Açıklama'] = raw[mapping['aciklama']].astype(str).str.strip()
     out = out.dropna(subset=['Koyun No']).drop_duplicates('Koyun No').reset_index(drop=True)
-    return out
+    return out, info
 
 
 def birlestir(puan_dosyalari: dict, aktif: pd.DataFrame | None) -> pd.DataFrame:
@@ -598,13 +643,16 @@ if aktif_file:
 
     # Eşleştirmeyi uygula
     try:
-        aktif_df = aktif_df_olustur(raw, mapping)
+        aktif_df, aktif_info = aktif_df_olustur(raw, mapping)
     except ValueError as e:
         st.error(str(e))
         st.stop()
     except Exception as e:
         st.error(f'Aktif liste işlenemedi: {e}')
         st.stop()
+
+    if aktif_info.get('yas_kaynak'):
+        st.info(f"ℹ️ Yaş kaynağı: {aktif_info['yas_kaynak']}")
 
     # Irk filtresi
     if 'Irk' in aktif_df.columns:
