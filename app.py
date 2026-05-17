@@ -124,47 +124,100 @@ def puan_dosyasi_oku(file, yil_override: int | None = None) -> tuple[pd.DataFram
     return out, yil
 
 
-def aktif_liste_oku(file) -> pd.DataFrame:
-    """Aktif koyun listesi dosyasını oku — Koyun No içeren basit tablo."""
+# ── Aktif liste için dinamik okuma yardımcıları ────────────────────────────
+
+# Alan eşleştirme için otomatik tanıma anahtar kelimeleri
+AKTIF_ALANLAR = {
+    'koyun_no':   {'label': 'Koyun No (birleştirme anahtarı) ★', 'keywords': ['isletme no', 'işletme no', 'koyun no', 'koyunno', 'işletme', 'isletme']},
+    'ukn':        {'label': 'UKN / Küpe No',                     'keywords': ['kupe no', 'küpe no', 'ukn', 'ulusal', 'kupeno']},
+    'yas':        {'label': 'Yaş / Çağı',                        'keywords': ['cagi', 'çağı', 'yas', 'yaş', 'cag']},
+    'dogum_tipi': {'label': 'Doğum Tipi',                        'keywords': ['dogum tipi', 'doğum tipi']},
+    'dogum_tar':  {'label': 'Doğum Tarihi',                      'keywords': ['dogum tarihi', 'doğum tarihi']},
+    'irk':        {'label': 'Irk (filtre için)',                 'keywords': ['irk', 'cins']},
+    'padok':      {'label': 'Padok',                             'keywords': ['padok', 'aktif padok']},
+    'rfid':       {'label': 'RFID',                              'keywords': ['rfid', 'transponder']},
+    'aciklama':   {'label': 'Açıklama',                          'keywords': ['aciklama', 'açıklama', 'not']},
+}
+
+
+def _norm(s: str) -> str:
+    """Türkçe karakter + boşluk + büyük/küçük harf normalize."""
+    s = str(s).lower().strip()
+    return (s.replace('ı', 'i').replace('ğ', 'g').replace('ü', 'u')
+             .replace('ş', 's').replace('ö', 'o').replace('ç', 'c')
+             .replace('_', ' ').replace('-', ' '))
+
+
+def aktif_sayfalari_listele(file) -> list[str]:
+    """Excel dosyasındaki sayfa adlarını döndür."""
     name = getattr(file, 'name', '').lower()
     if name.endswith('.csv'):
+        return ['(CSV — tek tablo)']
+    try:
+        xl = pd.ExcelFile(file, engine='openpyxl')
+        return xl.sheet_names
+    except Exception:
+        return []
+
+
+def aktif_sayfayi_oku(file, sayfa: str | None, header_row: int) -> pd.DataFrame:
+    """Bir Excel sayfasını veya CSV'yi belirli bir başlık satırından oku."""
+    name = getattr(file, 'name', '').lower()
+    file.seek(0)
+    if name.endswith('.csv'):
         try:
-            df = pd.read_csv(file, encoding='utf-8-sig')
+            df = pd.read_csv(file, header=header_row, encoding='utf-8-sig')
         except UnicodeDecodeError:
             file.seek(0)
-            df = pd.read_csv(file, encoding='cp1254')
+            df = pd.read_csv(file, header=header_row, encoding='cp1254')
     else:
-        df = pd.read_excel(file, engine='openpyxl')
+        df = pd.read_excel(file, sheet_name=sayfa, header=header_row, engine='openpyxl')
+    df.columns = [re.sub(r'\s+', ' ', str(c).strip()) for c in df.columns]
+    df = df.dropna(how='all').reset_index(drop=True)
+    return df
 
-    df.columns = [str(c).strip() for c in df.columns]
-    # Koyun No bulmaya çalış
-    koyun_kol = None
-    for col in df.columns:
-        cl = col.lower().replace('ı', 'i')
-        if cl in ('koyun no', 'koyun_no', 'koyunno', 'no', 'kn'):
-            koyun_kol = col
-            break
-    if koyun_kol is None:
-        raise ValueError(f"'Koyun No' sütunu bulunamadı. Sütunlar: {list(df.columns)}")
 
-    out = pd.DataFrame({
-        'Koyun No': pd.to_numeric(df[koyun_kol], errors='coerce').astype('Int64'),
-    })
-    # Diğer sütunlar varsa al (Yaş, Doğum Tipi, UKN, Padok vs.)
-    for col in df.columns:
-        if col == koyun_kol:
-            continue
-        cl = col.lower().replace('ı', 'i').replace('ğ', 'g')
-        if 'ukn' in cl or 'ulusal' in cl:
-            out['UKN'] = df[col].astype(str).str.strip()
-        elif 'yas' in cl or 'yaş' in cl or 'cag' in cl or 'çağ' in cl:
-            out['Aktif Yaş'] = pd.to_numeric(df[col], errors='coerce')
-        elif 'dogum tipi' in cl or 'doğum tipi' in cl:
-            out['Aktif Doğum Tipi'] = df[col].astype(str).str.strip()
-        elif 'padok' in cl:
-            out['Padok'] = df[col].astype(str).str.strip()
-        elif 'irk' in cl or 'cins' in cl:
-            out['Irk'] = df[col].astype(str).str.strip()
+def otomatik_aktif_eslestir(columns: list[str]) -> dict:
+    """Sütun adlarına bakarak alanları otomatik eşle. Hiçbiri eşleşmezse boş döner."""
+    cm = {}
+    norm_cols = [(c, _norm(c)) for c in columns]
+    for alan, conf in AKTIF_ALANLAR.items():
+        for col, nc in norm_cols:
+            for kw in conf['keywords']:
+                if _norm(kw) == nc or _norm(kw) in nc:
+                    # Koyun No için "küpe no" yakalamasın
+                    if alan == 'koyun_no' and ('kupe' in nc or 'ukn' in nc):
+                        continue
+                    if col not in cm.values():
+                        cm[alan] = col
+                        break
+            if alan in cm:
+                break
+    return cm
+
+
+def aktif_df_olustur(raw: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    """Kullanıcı eşleştirmesine göre standart sütunlu aktif liste üret."""
+    out = pd.DataFrame()
+    if 'koyun_no' not in mapping or not mapping['koyun_no']:
+        raise ValueError("Koyun No alanı eşleştirilmedi.")
+    out['Koyun No'] = pd.to_numeric(raw[mapping['koyun_no']], errors='coerce').astype('Int64')
+    if mapping.get('ukn'):
+        out['UKN'] = raw[mapping['ukn']].astype(str).str.strip()
+    if mapping.get('yas'):
+        out['Aktif Yaş'] = pd.to_numeric(raw[mapping['yas']], errors='coerce')
+    if mapping.get('dogum_tipi'):
+        out['Aktif Doğum Tipi'] = raw[mapping['dogum_tipi']].astype(str).str.strip()
+    if mapping.get('dogum_tar'):
+        out['Doğum Tarihi'] = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce')
+    if mapping.get('irk'):
+        out['Irk'] = raw[mapping['irk']].astype(str).str.strip()
+    if mapping.get('padok'):
+        out['Padok'] = raw[mapping['padok']].astype(str).str.strip()
+    if mapping.get('rfid'):
+        out['RFID'] = raw[mapping['rfid']].astype(str).str.strip()
+    if mapping.get('aciklama'):
+        out['Açıklama'] = raw[mapping['aciklama']].astype(str).str.strip()
     out = out.dropna(subset=['Koyun No']).drop_duplicates('Koyun No').reset_index(drop=True)
     return out
 
@@ -450,25 +503,129 @@ if dosya_ozet:
 st.header('2. Aktif Koyun Listesi')
 st.caption(
     'Çiftleşmesi muhtemel, şu an yaşayan koyunların listesi (Excel/CSV). '
-    'Yüklenmezse tüm puan dosyalarındaki koyunlar gösterilir. '
-    "Sütun isimleri: 'Koyun No' zorunlu; opsiyonel: UKN, Yaş, Doğum Tipi, Padok, Irk."
+    'Sayfa, başlık satırı, sütun eşleştirmesi ve ırk filtresi tamamen dinamik.'
 )
 
 aktif_file = st.file_uploader(
     'Aktif liste dosyası (Excel/CSV) — opsiyonel',
-    type=['xlsx', 'csv'],
+    type=['xlsx', 'xlsm', 'csv'],
     key='aktif_file',
 )
 
 aktif_df = None
 if aktif_file:
+    is_csv = aktif_file.name.lower().endswith('.csv')
+
+    # Sayfa seçimi (Excel için) + başlık satırı
+    c1, c2 = st.columns([2, 1])
+    if is_csv:
+        secili_sayfa = None
+        c1.text('CSV — sayfa seçimi yok')
+    else:
+        sayfa_listesi = aktif_sayfalari_listele(aktif_file)
+        if not sayfa_listesi:
+            st.error('Excel dosyası okunamadı veya sayfa bulunamadı.')
+            st.stop()
+        # Varsayılan: "sürü", "koyun", "liste" içeren sayfa varsa onu seç
+        default_idx = 0
+        for i, s in enumerate(sayfa_listesi):
+            n = _norm(s)
+            if 'suru' in n or 'koyun' in n or 'liste' in n or 'aktif' in n:
+                default_idx = i
+                break
+        secili_sayfa = c1.selectbox('Sayfa', sayfa_listesi, index=default_idx, key='aktif_sayfa')
+
+    header_row = c2.number_input(
+        'Başlık satırı (1-tabanlı)',
+        min_value=1, max_value=20, value=1, step=1, key='aktif_header',
+        help='Başlıklar 1. satırda değilse buradan değiştir.',
+    )
+
+    # Sayfayı oku
     try:
-        aktif_df = aktif_liste_oku(aktif_file)
-        st.success(f'✓ Aktif listede {len(aktif_df)} koyun.')
-        with st.expander('Aktif liste önizleme', expanded=False):
-            st.dataframe(aktif_df.head(20), use_container_width=True, hide_index=True)
+        raw = aktif_sayfayi_oku(aktif_file, secili_sayfa, int(header_row) - 1)
     except Exception as e:
-        st.error(f'Aktif liste okunamadı: {e}')
+        st.error(f'Sayfa okunamadı: {e}')
+        st.stop()
+
+    st.caption(f'**{len(raw)} satır × {len(raw.columns)} sütun** okundu.')
+
+    with st.expander('Ham veri önizleme (ilk 10 satır)', expanded=False):
+        st.dataframe(raw.head(10), use_container_width=True)
+
+    # Otomatik sütun eşleştirme
+    auto_cm = otomatik_aktif_eslestir(list(raw.columns))
+
+    # Session state ile koru
+    map_key = f'aktif_map_{secili_sayfa or "csv"}_{header_row}_{tuple(raw.columns)}'
+    if st.session_state.get('_aktif_map_key') != map_key:
+        st.session_state['_aktif_map_key'] = map_key
+        st.session_state['aktif_mapping'] = dict(auto_cm)
+
+    NONE_LBL = '(Yok)'
+    col_opts = [NONE_LBL] + list(raw.columns)
+
+    st.subheader('Sütun Eşleştirme')
+    st.caption('★ = zorunlu. Otomatik tanınanlar seçili — yanlışsa düzelt.')
+
+    with st.expander('Eşleştirmeyi göster/düzenle', expanded=True):
+        cA, cB = st.columns(2)
+        alanlar = list(AKTIF_ALANLAR.keys())
+        half = (len(alanlar) + 1) // 2
+        mapping = {}
+        for i, alan in enumerate(alanlar):
+            target = cA if i < half else cB
+            with target:
+                cur = st.session_state['aktif_mapping'].get(alan, NONE_LBL)
+                if cur not in col_opts:
+                    cur = NONE_LBL
+                sel = st.selectbox(
+                    AKTIF_ALANLAR[alan]['label'],
+                    col_opts,
+                    index=col_opts.index(cur),
+                    key=f'aktif_sel_{alan}',
+                )
+                if sel != NONE_LBL:
+                    mapping[alan] = sel
+                st.session_state['aktif_mapping'][alan] = sel
+
+        if st.button('Otomatik tanıyı tekrar uygula', key='aktif_auto_btn'):
+            for alan in AKTIF_ALANLAR:
+                v = auto_cm.get(alan, NONE_LBL)
+                st.session_state['aktif_mapping'][alan] = v
+                st.session_state[f'aktif_sel_{alan}'] = v
+            st.rerun()
+
+    # Eşleştirmeyi uygula
+    try:
+        aktif_df = aktif_df_olustur(raw, mapping)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+    except Exception as e:
+        st.error(f'Aktif liste işlenemedi: {e}')
+        st.stop()
+
+    # Irk filtresi
+    if 'Irk' in aktif_df.columns:
+        st.subheader('Irk Filtresi')
+        irklar = sorted({v for v in aktif_df['Irk'].dropna().tolist() if str(v).strip()})
+        sec_key = 'aktif_irk_secim'
+        if sec_key not in st.session_state:
+            st.session_state[sec_key] = irklar
+        secili_irklar = st.multiselect(
+            'Hangi ırklar dahil edilsin? (Boş = hepsi)',
+            options=irklar,
+            key=sec_key,
+        )
+        if secili_irklar:
+            before = len(aktif_df)
+            aktif_df = aktif_df[aktif_df['Irk'].isin(secili_irklar)].reset_index(drop=True)
+            st.info(f"Irk filtresi: **{', '.join(secili_irklar)}** — {before} → {len(aktif_df)} koyun.")
+
+    st.success(f'✓ Aktif listede **{len(aktif_df)}** koyun (eşleştirme uygulandı).')
+    with st.expander('Standart aktif liste önizleme', expanded=False):
+        st.dataframe(aktif_df.head(20), use_container_width=True, hide_index=True)
 
 # ──────────────────────────────────────────────────────────────────────────
 # ADIM 3 — BİRLEŞTİR + HESAPLA
