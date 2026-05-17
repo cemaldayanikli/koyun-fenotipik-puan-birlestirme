@@ -165,6 +165,44 @@ def otomatik_aktif_eslestir(columns: list[str]) -> dict:
     return cm
 
 
+def _parse_dogum_tarihi(seri: pd.Series) -> tuple[pd.Series, str]:
+    """Doğum tarihi sütununu akıllıca parse et.
+    Dönüş: (Timestamp series, açıklama)
+
+    Kritik bug: pd.to_datetime(2017, errors='coerce') → 1970-01-01 + 2017ns
+    (nanosaniye epoch). Bu yüzden önce sayısal aralık kontrolü yapılır.
+    """
+    # Önce string olarak deneme — gerçek tarih formatları için
+    s_str = seri.astype(str).str.strip()
+    has_separator = s_str.str.contains(r'[./-]', regex=True, na=False).any()
+
+    s_num = pd.to_numeric(seri, errors='coerce')
+    n_num = s_num.notna().sum()
+
+    if n_num > 0 and not has_separator:
+        med = s_num.median()
+        # 1900-2100 → integer yıllar → yyyy-01-01 yap
+        if 1900 <= med <= 2100:
+            yillar = s_num.fillna(-1).astype('Int64')
+            tarihler = pd.Series(
+                [pd.Timestamp(year=int(y), month=1, day=1) if y > 0 else pd.NaT for y in yillar],
+                index=seri.index,
+            )
+            return tarihler, f'Sayısal yıl ({int(med)} medyan) → 1 Ocak yyyy'
+        # Excel serial date (1900-01-01 = 1, ~25000-50000 = 1968-2036)
+        if 10000 <= med <= 80000:
+            tarihler = pd.to_datetime(s_num, unit='D', origin='1899-12-30', errors='coerce')
+            return tarihler, 'Excel serial tarih'
+
+    # String tarih (gg.aa.yyyy veya yyyy-mm-dd)
+    tarihler = pd.to_datetime(seri, errors='coerce', dayfirst=True)
+    if tarihler.notna().any():
+        return tarihler, 'Tarih formatı (gg.aa.yyyy)'
+
+    # Son çare
+    return pd.Series([pd.NaT] * len(seri), index=seri.index), 'Parse edilemedi'
+
+
 def _yas_normalize(seri: pd.Series, bugun_yil: int, format_secim: str = 'otomatik') -> tuple[pd.Series, str]:
     """Yaş değerlerini standart yıl cinsine çevir.
     format_secim: 'otomatik' | 'yil' | 'dogum_yili' | 'tarih' | 'gun'
@@ -217,11 +255,14 @@ def aktif_df_olustur(raw: pd.DataFrame, mapping: dict, yas_format: str = 'otomat
     bugun_yil = datetime.now().year
     yas_set = False
 
-    # Doğum Tarihi sütununu her durumda al
+    # Doğum Tarihi sütununu akıllı parse et (yıl mı, tarih mi, Excel serial mi)
+    dt_parsed = None
+    dt_aciklama = None
     if mapping.get('dogum_tar'):
-        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce', dayfirst=True)
-        if dt.notna().any():
-            out['Doğum Tarihi'] = dt
+        dt_parsed, dt_aciklama = _parse_dogum_tarihi(raw[mapping['dogum_tar']])
+        if dt_parsed.notna().any():
+            out['Doğum Tarihi'] = dt_parsed
+            info['dogum_tar_format'] = dt_aciklama
 
     # Yaş kaynağı: 'auto' → önce dogum_tar, sonra yas. 'dogum_tar' / 'yas' zorla.
     use_dogum_tar = yas_kaynak in ('auto', 'dogum_tar') and mapping.get('dogum_tar')
@@ -234,13 +275,12 @@ def aktif_df_olustur(raw: pd.DataFrame, mapping: dict, yas_format: str = 'otomat
         info['uyari'] = "Yaş kaynağı 'Yaş alanı' seçildi ama eşleştirilmedi — Doğum Tarihi'ne bakılıyor."
         use_dogum_tar = bool(mapping.get('dogum_tar'))
 
-    if use_dogum_tar:
-        dt = pd.to_datetime(raw[mapping['dogum_tar']], errors='coerce', dayfirst=True)
-        if dt.notna().any():
-            yas_d = (pd.Timestamp(year=bugun_yil, month=1, day=1) - dt).dt.days / 365.25
-            out['Aktif Yaş'] = yas_d.round(1)
-            info['yas_kaynak'] = f"Doğum Tarihinden ('{mapping['dogum_tar']}') hesaplandı"
-            yas_set = True
+    if use_dogum_tar and dt_parsed is not None and dt_parsed.notna().any():
+        bugun = pd.Timestamp(year=bugun_yil, month=1, day=1)
+        yas_d = (bugun - dt_parsed).dt.days / 365.25
+        out['Aktif Yaş'] = yas_d.round(1)
+        info['yas_kaynak'] = f"Doğum Tarihi'nden hesaplandı ({dt_aciklama})"
+        yas_set = True
 
     if use_yas and not yas_set:
         yas_norm, tip = _yas_normalize(raw[mapping['yas']], bugun_yil, format_secim=yas_format)
@@ -625,6 +665,11 @@ if aktif_file:
         st.warning(f"⚠️ {aktif_info['uyari']}")
     if aktif_info.get('yas_kaynak'):
         st.info(f"ℹ️ Yaş kaynağı: {aktif_info['yas_kaynak']}")
+
+    # Doğum Tarihi örnek değerler — kullanıcı doğru parse edildi mi görsün
+    if 'Doğum Tarihi' in aktif_df.columns and aktif_df['Doğum Tarihi'].notna().any():
+        ornek = aktif_df['Doğum Tarihi'].dropna().head(3).dt.strftime('%d.%m.%Y').tolist()
+        st.caption(f"📅 İlk 3 doğum tarihi: {', '.join(ornek)}")
 
     # Yaş istatistikleri (debug için)
     if 'Aktif Yaş' in aktif_df.columns and aktif_df['Aktif Yaş'].notna().any():
