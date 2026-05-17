@@ -33,38 +33,6 @@ EXPECTED_COLS = {
     'puan':       ['Fenotipik İndeks', 'Fenotipik Indeks', 'Puan', 'İndeks'],
 }
 
-# Önceden tanımlı öneri şablonları
-SABLONLAR = {
-    'Standart': {
-        'damizlik_min_puan':    60.0,
-        'damizlik_max_yas':     6,
-        'reforme_max_puan':     40.0,
-        'reforme_min_yas':      7,
-        'tek_dogum_cezasi':     True,   # Yaş≥5 + Doğum Tipi=T + Puan<50 → reforme
-        'tek_dogum_min_yas':    5,
-        'tek_dogum_max_puan':   50.0,
-    },
-    'Sıkı': {
-        'damizlik_min_puan':    70.0,
-        'damizlik_max_yas':     5,
-        'reforme_max_puan':     50.0,
-        'reforme_min_yas':      6,
-        'tek_dogum_cezasi':     True,
-        'tek_dogum_min_yas':    4,
-        'tek_dogum_max_puan':   55.0,
-    },
-    'Gevşek': {
-        'damizlik_min_puan':    45.0,
-        'damizlik_max_yas':     7,
-        'reforme_max_puan':     30.0,
-        'reforme_min_yas':      8,
-        'tek_dogum_cezasi':     False,
-        'tek_dogum_min_yas':    5,
-        'tek_dogum_max_puan':   50.0,
-    },
-}
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # YARDIMCI FONKSİYONLAR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -389,35 +357,7 @@ def ortalamalari_hesapla(df: pd.DataFrame, yillar: list[int], agirlik_son: float
     return df, agirliklar
 
 
-def oneri_uret(df: pd.DataFrame, sablon: dict, hangi_ort: str = 'Basit Ort') -> pd.Series:
-    """Hibrit öneri rozeti: 'Damızlık' / 'Reforme' / 'Sınırda'."""
-    p = df[hangi_ort].fillna(0)
-    y = df['Yaş'].fillna(0)
-    dt = df['Doğum Tipi'].astype(str).str.strip().str.upper()
-
-    onerii = pd.Series('Sınırda', index=df.index, dtype=object)
-
-    # Damızlık koşulu
-    damizlik_mask = (p >= sablon['damizlik_min_puan']) & (y <= sablon['damizlik_max_yas']) & (y > 0)
-
-    # Reforme koşulu — birkaç alternatif
-    reforme_mask = (p <= sablon['reforme_max_puan']) | (y >= sablon['reforme_min_yas'])
-    if sablon.get('tek_dogum_cezasi'):
-        tek_dogum_reforme = (
-            (y >= sablon['tek_dogum_min_yas']) &
-            (dt == 'T') &
-            (p < sablon['tek_dogum_max_puan'])
-        )
-        reforme_mask = reforme_mask | tek_dogum_reforme
-
-    onerii.loc[reforme_mask] = 'Reforme'
-    onerii.loc[damizlik_mask & ~reforme_mask] = 'Damızlık'
-    # Damızlık ve reforme aynı anda işaretliyse → reforme öncelikli (zaten üst sırada)
-    return onerii
-
-
-def excel_olarak_indir(df: pd.DataFrame, yillar: list[int], agirliklar: list[float],
-                       sablon: dict, sablon_adi: str) -> bytes:
+def excel_olarak_indir(df: pd.DataFrame, yillar: list[int], agirliklar: list[float]) -> bytes:
     """Sonuç tablosunu Excel olarak paketle."""
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine='xlsxwriter') as xw:
@@ -432,31 +372,22 @@ def excel_olarak_indir(df: pd.DataFrame, yillar: list[int], agirliklar: list[flo
             ws.set_column(i, i, width)
 
         # Ayarlar sayfası
-        ayar_df = pd.DataFrame([
-            ('Şablon', sablon_adi),
-            ('Damızlık min puan', sablon['damizlik_min_puan']),
-            ('Damızlık max yaş', sablon['damizlik_max_yas']),
-            ('Reforme max puan', sablon['reforme_max_puan']),
-            ('Reforme min yaş', sablon['reforme_min_yas']),
-            ('Tek doğum cezası', sablon.get('tek_dogum_cezasi', False)),
-            ('Tek doğum min yaş', sablon.get('tek_dogum_min_yas', '')),
-            ('Tek doğum max puan', sablon.get('tek_dogum_max_puan', '')),
-        ] + [(f'Ağırlık {y}', a) for y, a in zip(yillar, agirliklar)],
-            columns=['Parametre', 'Değer'])
+        ayar_df = pd.DataFrame(
+            [(f'Ağırlık {y}', a) for y, a in zip(yillar, agirliklar)],
+            columns=['Parametre', 'Değer'],
+        )
         ayar_df.to_excel(xw, sheet_name='Ayarlar', index=False)
 
     return bio.getvalue()
 
 
 def sheets_yapistir_formati(df: pd.DataFrame, yillar: list[int]) -> str:
-    """Google Sheets 'Puanlar' sayfasına yapıştırılacak tab-separated metin.
-    Şema: Koyun No | Yıl Sayısı | Puan_YYYY... | Basit Ort | Ağırlıklı Ort | Rank Basit | Rank Ağırlıklı | Öneri
-    """
+    """Google Sheets 'Puanlar' sayfasına yapıştırılacak tab-separated metin."""
     kols = ['Koyun No']
     if 'UKN' in df.columns:
         kols.append('UKN')
     kols += [f'Puan {y}' for y in yillar]
-    kols += ['Basit Ort', 'Ağırlıklı Ort', 'Yıl Sayısı', 'Rank Basit', 'Rank Ağırlıklı', 'Yaş', 'Doğum Tipi', 'Öneri']
+    kols += ['Basit Ort', 'Ağırlıklı Ort', 'Yıl Sayısı', 'Rank Basit', 'Rank Ağırlıklı', 'Yaş', 'Doğum Tipi']
     kols = [k for k in kols if k in df.columns]
     return df[kols].to_csv(sep='\t', index=False, lineterminator='\n')
 
@@ -487,93 +418,9 @@ with st.sidebar:
     orta_yil_sayisi = st.number_input('Kaç orta yıl bu ağırlıkta?', value=1, min_value=1, step=1)
     agirlik_eski = st.number_input('Eski yıl ağırlığı', value=1.0, min_value=0.0, step=0.1)
 
-    st.subheader('2. Öneri Şablonu')
-    sablon_adi = st.selectbox(
-        'Şablon (başlangıç değerleri)',
-        ['Standart', 'Sıkı', 'Gevşek', 'Özel'],
-        index=0,
-        help='Şablonu seçtikten sonra aşağıdaki tüm parametreleri düzenleyebilirsin.',
-        key='sablon_adi',
-    )
-
-    # Şablon değişince parametreleri sıfırla
-    if st.session_state.get('_son_sablon') != sablon_adi:
-        st.session_state['_son_sablon'] = sablon_adi
-        baz = dict(SABLONLAR['Standart']) if sablon_adi == 'Özel' else dict(SABLONLAR[sablon_adi])
-        st.session_state['aktif_sablon'] = baz
-        # Widget key'leri de güncellensin
-        for k, v in baz.items():
-            st.session_state[f'param_{k}'] = v
-
-    s = st.session_state['aktif_sablon']
-
-    st.caption('⚙️ Tüm parametreler düzenlenebilir — şablon sadece başlangıç değeri verir.')
-
-    c1, c2 = st.columns(2)
-    s['damizlik_min_puan'] = c1.number_input(
-        'Damızlık min puan',
-        value=float(s['damizlik_min_puan']),
-        min_value=0.0, max_value=100.0, step=1.0,
-        key='param_damizlik_min_puan',
-    )
-    s['damizlik_max_yas'] = c2.number_input(
-        'Damızlık max yaş',
-        value=int(s['damizlik_max_yas']),
-        min_value=1, max_value=20, step=1,
-        key='param_damizlik_max_yas',
-    )
-    s['reforme_max_puan'] = c1.number_input(
-        'Reforme max puan',
-        value=float(s['reforme_max_puan']),
-        min_value=0.0, max_value=100.0, step=1.0,
-        key='param_reforme_max_puan',
-    )
-    s['reforme_min_yas'] = c2.number_input(
-        'Reforme min yaş',
-        value=int(s['reforme_min_yas']),
-        min_value=1, max_value=20, step=1,
-        key='param_reforme_min_yas',
-    )
-    s['tek_dogum_cezasi'] = st.checkbox(
-        'Tek doğum cezası (yaşlı + T + düşük puan → reforme)',
-        value=bool(s['tek_dogum_cezasi']),
-        key='param_tek_dogum_cezasi',
-    )
-    if s['tek_dogum_cezasi']:
-        c1, c2 = st.columns(2)
-        s['tek_dogum_min_yas'] = c1.number_input(
-            'TD min yaş',
-            value=int(s['tek_dogum_min_yas']),
-            min_value=1, max_value=20, step=1,
-            key='param_tek_dogum_min_yas',
-        )
-        s['tek_dogum_max_puan'] = c2.number_input(
-            'TD max puan',
-            value=float(s['tek_dogum_max_puan']),
-            min_value=0.0, max_value=100.0, step=1.0,
-            key='param_tek_dogum_max_puan',
-        )
-
-    # Parametre tutarlılığı uyarıları
-    uyarilar = []
-    if s['reforme_min_yas'] <= s['damizlik_max_yas']:
-        uyarilar.append(
-            f"⚠️ **Reforme min yaş ({s['reforme_min_yas']}) ≤ Damızlık max yaş ({s['damizlik_max_yas']})** — "
-            f"reforme yaş eşiği damızlık eşiğinden büyük olmalı, yoksa damızlık yaş aralığındaki koyunlar reforme'ye düşer."
-        )
-    if s['reforme_max_puan'] >= s['damizlik_min_puan']:
-        uyarilar.append(
-            f"⚠️ **Reforme max puan ({s['reforme_max_puan']}) ≥ Damızlık min puan ({s['damizlik_min_puan']})** — "
-            f"puan eşikleri çakışıyor. Reforme max < Damızlık min olmalı (örn: reforme 40, damızlık 60)."
-        )
-    for u in uyarilar:
-        st.warning(u)
-
-    secili_sablon = s
-
-    st.subheader('3. Öneri Hangi Ortalamaya Göre?')
+    st.subheader('2. Sıralama Tabanı')
     hangi_ort = st.radio(
-        'Hangi ortalamaya göre öneri yapılsın?',
+        'Tabloyu hangi ortalamaya göre sıralayalım?',
         ['Basit Ort', 'Ağırlıklı Ort'],
         index=0,
         horizontal=True,
@@ -847,17 +694,15 @@ birlesim, agirliklar = ortalamalari_hesapla(
     agirlik_son=agirlik_son, agirlik_orta=agirlik_orta, agirlik_eski=agirlik_eski,
     son_yil_sayisi=int(son_yil_sayisi), orta_yil_sayisi=int(orta_yil_sayisi),
 )
-birlesim['Öneri'] = oneri_uret(birlesim, secili_sablon, hangi_ort=hangi_ort)
 
 # Sıralama
 birlesim_sorted = birlesim.sort_values(hangi_ort, ascending=False).reset_index(drop=True)
 
 # Özet metrikler
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 c1.metric('Toplam Koyun', len(birlesim_sorted))
-c2.metric('Damızlık Önerisi', int((birlesim_sorted['Öneri'] == 'Damızlık').sum()))
-c3.metric('Reforme Önerisi',  int((birlesim_sorted['Öneri'] == 'Reforme').sum()))
-c4.metric('Sınırda',           int((birlesim_sorted['Öneri'] == 'Sınırda').sum()))
+c2.metric(f'Ort. {hangi_ort}', f"{birlesim_sorted[hangi_ort].mean():.2f}")
+c3.metric(f'Max {hangi_ort}', f"{birlesim_sorted[hangi_ort].max():.2f}")
 
 # Ağırlık özeti
 ag_yazi = ', '.join(f'{y}→{a:.1f}' for y, a in zip(yillar, agirliklar))
@@ -865,42 +710,27 @@ st.caption(f'Ağırlıklar: {ag_yazi}')
 
 # Sütun düzeni
 goster_kols = ['Koyun No']
-for opt in ('UKN', 'Padok', 'Irk'):
+for opt in ('UKN', 'Padok', 'Irk', 'Çağı'):
     if opt in birlesim_sorted.columns:
         goster_kols.append(opt)
 goster_kols += ['Yaş', 'Doğum Tipi']
 goster_kols += [f'Puan {y}' for y in yillar]
-goster_kols += ['Basit Ort', 'Ağırlıklı Ort', 'Yıl Sayısı', 'Rank Basit', 'Rank Ağırlıklı', 'Öneri']
+goster_kols += ['Basit Ort', 'Ağırlıklı Ort', 'Yıl Sayısı', 'Rank Basit', 'Rank Ağırlıklı']
 goster_kols = [k for k in goster_kols if k in birlesim_sorted.columns]
 
-# Renklendirme
-def renklendir_oneri(val):
-    if val == 'Damızlık':
-        return 'background-color: #d4edda; color: #155724; font-weight: bold'
-    if val == 'Reforme':
-        return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
-    return 'background-color: #fff3cd; color: #856404'
-
-st.subheader('Sonuç Tablosu (makrolu Excel "Puan" sayfası karşılığı)')
-styled = birlesim_sorted[goster_kols].style.map(renklendir_oneri, subset=['Öneri'])
-st.dataframe(styled, use_container_width=True, height=600)
+st.subheader('Sonuç Tablosu')
+st.dataframe(birlesim_sorted[goster_kols], use_container_width=True, height=600)
 
 # Filtre kutusu — hızlı arama
 with st.expander('🔍 Filtre / Arama', expanded=False):
-    c1, c2, c3 = st.columns(3)
-    oneri_filtre = c1.multiselect('Öneri', ['Damızlık', 'Reforme', 'Sınırda'], default=[])
-    min_puan = c2.number_input('Min ortalama puan', value=0.0, step=1.0)
-    arama_kn = c3.text_input('Koyun No ara')
+    c1, c2 = st.columns(2)
+    min_puan = c1.number_input('Min ortalama puan', value=0.0, step=1.0)
+    arama_kn = c2.text_input('Koyun No ara')
     f = birlesim_sorted.copy()
-    if oneri_filtre:
-        f = f[f['Öneri'].isin(oneri_filtre)]
     f = f[f[hangi_ort] >= min_puan]
     if arama_kn.strip():
         f = f[f['Koyun No'].astype(str).str.contains(arama_kn.strip())]
-    st.dataframe(
-        f[goster_kols].style.map(renklendir_oneri, subset=['Öneri']),
-        use_container_width=True, height=400,
-    )
+    st.dataframe(f[goster_kols], use_container_width=True, height=400)
     st.caption(f'{len(f)} sonuç.')
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -913,7 +743,7 @@ c1, c2, c3 = st.columns(3)
 
 with c1:
     xlsx_bytes = excel_olarak_indir(
-        birlesim_sorted[goster_kols], yillar, agirliklar, secili_sablon, sablon_adi,
+        birlesim_sorted[goster_kols], yillar, agirliklar,
     )
     st.download_button(
         'Excel olarak indir (.xlsx)',
